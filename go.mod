@@ -1,4 +1,4 @@
-module github.com/superuserkalo/glavata
+module github.com/superuserkalo/glav
 
 go 1.24.4
 
