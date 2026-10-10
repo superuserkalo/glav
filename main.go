@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,12 +32,10 @@ type bot struct {
 	apiBase string
 	agentUrl string
 	inboxDir string
-	// The only place voice files to send may come from.
-	outboxDir string
 	// Shared with the agent. Both sides refuse a request without it, so nothing else on this machine, a web page in a
 	// browser included, can pose as the other.
 	secret string
-	// Telegram user IDs that may talk to the bot. Empty means nobody.
+	// Telegram IDs that may use the bot: users, and group chats they may use it in. Empty means nobody.
 	allowed map[int64]bool
 	// Strangers who were already told they are not allowed.
 	turnedAway map[int64]bool
@@ -69,7 +66,6 @@ func main() {
 		apiBase: baseUrl + token + "/",
 		agentUrl: "http://" + envOr("agent_addr", "127.0.0.1:8787") + "/inbound",
 		inboxDir: inboxDir,
-		outboxDir: filepath.Join(filepath.Dir(inboxDir), "outbox"),
 		allowed: parseAllowed(os.Getenv("allowed_users")),
 		turnedAway: map[int64]bool{},
 	}
@@ -80,7 +76,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /send", b.authorized(b.sendHandler))
 	mux.HandleFunc("POST /draft", b.authorized(b.draftHandler))
-	mux.HandleFunc("POST /voice", b.authorized(b.voiceHandler))
 	mux.HandleFunc("POST /commands", b.authorized(b.commandsHandler))
 	go func() {
 		log.Fatal(http.ListenAndServe(envOr("send_addr", "127.0.0.1:8788"), mux))
@@ -138,11 +133,7 @@ func permanent(err error) bool {
 
 // call runs one Bot API method and returns its result.
 func (b *bot) call(method string, values url.Values) (json.RawMessage, error) {
-	return b.request(method, "application/x-www-form-urlencoded", strings.NewReader(values.Encode()))
-}
-
-func (b *bot) request(method string, contentType string, body io.Reader) (json.RawMessage, error) {
-	resp, err := client.Post(b.apiBase+method, contentType, body)
+	resp, err := client.PostForm(b.apiBase+method, values)
 	if err != nil {
 		// The error carries the request URL, which holds the bot token.
 		return nil, errors.New("telegram unreachable")
@@ -267,40 +258,6 @@ func (b *bot) draftHandler(w http.ResponseWriter, r *http.Request) {
 		_, err = b.call("sendRichMessageDraft", values)
 	}
 	if err != nil {
-		refuse(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-// voiceHandler sends a file from the outbox as a voice message.
-func (b *bot) voiceHandler(w http.ResponseWriter, r *http.Request) {
-	var v Voice
-	if err := json.NewDecoder(r.Body).Decode(&v); err != nil || v.ChatID == 0 || v.Path == "" {
-		http.Error(w, "expected chat_id and path", http.StatusBadRequest)
-		return
-	}
-	if rel, err := filepath.Rel(b.outboxDir, filepath.Clean(v.Path)); err != nil || !filepath.IsLocal(rel) {
-		http.Error(w, "path is outside the outbox", http.StatusBadRequest)
-		return
-	}
-	audio, err := os.ReadFile(v.Path)
-	if err != nil {
-		http.Error(w, "cannot read the voice file", http.StatusBadRequest)
-		return
-	}
-
-	var body bytes.Buffer
-	form := multipart.NewWriter(&body)
-	form.WriteField("chat_id", strconv.FormatInt(v.ChatID, 10))
-	if v.Caption != "" {
-		form.WriteField("caption", v.Caption)
-	}
-	part, _ := form.CreateFormFile("voice", "voice.ogg")
-	part.Write(audio)
-	form.Close()
-	if _, err := b.request("sendVoice", form.FormDataContentType(), &body); err != nil {
-		log.Println("sendVoice error:", err)
 		refuse(w, err)
 		return
 	}
@@ -440,7 +397,9 @@ func (b *bot) handle(u Update) error {
 	if m == nil || m.Chat == nil || m.From == nil {
 		return nil
 	}
-	if !b.allowed[m.From.ID] {
+	// The sender has to be allowed, and so does the place: answers go to the chat, where everyone in it reads them.
+	// A private chat has its user's ID. A group has to be listed itself.
+	if !b.allowed[m.From.ID] || !b.allowed[m.Chat.ID] {
 		b.turnAway(m)
 		return nil
 	}
@@ -470,7 +429,7 @@ func (b *bot) turnAway(m *Message) {
 		return
 	}
 	b.turnedAway[m.From.ID] = true
-	log.Printf("turned away user %d (%s)", m.From.ID, m.From.FirstName)
+	log.Printf("turned away user %d (%s) in chat %d", m.From.ID, m.From.FirstName, m.Chat.ID)
 	if m.Chat.ID != m.From.ID {
 		return
 	}

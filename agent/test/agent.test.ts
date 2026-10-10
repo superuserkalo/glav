@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -11,6 +11,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 
 import { type AgentOptions, COMMANDS, type RunningAgent, startAgent } from "../src/agent.ts";
+import { connectMcp } from "../src/mcp.ts";
 
 type Sent = { chat_id: number; text: string };
 
@@ -21,7 +22,6 @@ function fakeTransport(statuses: number[] = []) {
 	const sent: Sent[] = [];
 	const unauthorized: string[] = [];
 	const drafts: Drafted[] = [];
-	const voices: { chat_id: number; path: string; caption?: string; audio: string }[] = [];
 	const commands: unknown[] = [];
 	let attempts = 0;
 	const waiters: (() => void)[] = [];
@@ -32,7 +32,6 @@ function fakeTransport(statuses: number[] = []) {
 		const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 		if (request.url !== "/send") {
 			if (request.url === "/draft") drafts.push(body);
-			else if (request.url === "/voice") voices.push({ ...body, audio: await readFile(body.path, "utf8") });
 			else commands.push(body);
 			response.end();
 			for (const wake of waiters.splice(0)) wake();
@@ -48,7 +47,6 @@ function fakeTransport(statuses: number[] = []) {
 		sent,
 		unauthorized,
 		drafts,
-		voices,
 		commands,
 		attempts: () => attempts,
 		async listen() {
@@ -430,90 +428,90 @@ test("takes messages only with the shared secret, and sends it to the transport"
 	await transport.close();
 });
 
-test("/tts answers with voice messages, with the words as caption, until turned off", async () => {
+test("uses the tools of MCP servers, and /mcp lists them", async () => {
 	const transport = fakeTransport();
-	const workspace = join(directory, "tts-workspace");
-	await mkdir(workspace, { recursive: true });
-	const { agent, faux } = await start("tts", await transport.listen(), {
-		workspace,
-		speak: async (text) => new TextEncoder().encode(`spoken: ${text.slice(0, 20)}`),
+	process.env.GLAV_TEST_PREFIX = "sum=";
+	const mcp = await connectMcp({
+		calc: { command: process.execPath, args: [join(import.meta.dirname, "mcp-server.mjs")], env: { PREFIX: "${GLAV_TEST_PREFIX}" } },
+		gone: { command: join(directory, "no-such-server") },
+		off: { command: "anything", enabled: false },
 	});
-	const long = "long answer ".repeat(100).trim();
-	const prompts: string[] = [];
-	// Changes to the prompt and the offered tools travel as the newest system message.
-	const answer = (text: string) => (context: { messages: { role: string }[] }) => {
-		const system = JSON.stringify(context.messages.findLast((message) => message.role === "system"));
-		const offered = system.includes("send_text") && !system.includes('"toolsRemoved":[{"name":"send_text"}]');
-		prompts.push(`${system.includes("Voice mode is on") ? "voice" : "text"}:${offered ? "tool" : "no tool"}`);
+	const { agent, faux } = await start("mcp", await transport.listen(), { extensions: [mcp.extension!], describeMcp: mcp.describe });
+	const results: string[] = [];
+	const record = (text: string) => (context: { messages: { role: string; content: unknown; isError?: boolean }[] }) => {
+		const result = context.messages.findLast((message) => message.role === "toolResult");
+		results.push(`${JSON.stringify(result?.content)} error=${result?.isError}`);
 		return fauxAssistantMessage(text);
 	};
-	faux.setResponses([answer("first"), answer("second"), answer(long), answer("fourth")]);
-	const ask = async (update_id: number, text: string, done: () => boolean) => {
-		await inbound(agent, { update_id, chat_id: 12, text });
-		await transport.until(done);
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("mcp__calc__add", { a: 2, b: 40 })], { stopReason: "toolUse" }),
+		record("forty-two"),
+		fauxAssistantMessage([fauxToolCall("mcp__calc__fail", {})], { stopReason: "toolUse" }),
+		record("it failed"),
+		fauxAssistantMessage([fauxToolCall("mcp__calc__add", { a: "two" })], { stopReason: "toolUse" }),
+		record("bad arguments"),
+	]);
+	const ask = async (update_id: number, text: string) => {
+		const before = transport.sent.length;
+		await inbound(agent, { update_id, chat_id: 14, text });
+		await transport.until(() => transport.sent.length > before);
+		return transport.sent.at(-1)!.text;
 	};
 
-	await ask(1, "hi", () => transport.sent.length === 1);
-	await ask(2, "/tts", () => transport.sent.length === 2);
-	await ask(3, "hi", () => transport.voices.length === 1);
-	await ask(4, "hi", () => transport.voices.length === 2 && transport.sent.length === 3);
-	await ask(5, "/tts off", () => transport.sent.length === 4);
-	await ask(6, "hi", () => transport.sent.length === 5);
+	assert.equal(await ask(1, "add"), "forty-two");
+	assert.equal(await ask(2, "fail"), "it failed");
+	assert.equal(await ask(3, "add badly"), "bad arguments");
+	const listing = await ask(4, "/mcp");
 	await agent.close();
+	await mcp.close();
 
-	// A short answer is the voice message alone; a long one is followed by its text.
-	assert.deepEqual(
-		transport.sent.map((message) => message.text),
-		["first", "Voice mode on. I'll answer with voice messages, and send code and the like as text.", long, "Voice mode off.", "fourth"],
-	);
-	assert.deepEqual(
-		transport.voices.map((voice) => [voice.chat_id, voice.caption, voice.audio]),
-		[
-			[12, "second", "spoken: second"],
-			[12, undefined, "spoken: long answer long ans"],
-		],
-	);
-	assert.deepEqual(prompts, ["text:no tool", "voice:tool", "voice:tool", "text:no tool"]);
-	assert.ok(transport.voices[0]!.path.startsWith(join(workspace, "outbox")));
-	// The files are removed once handed over.
-	assert.deepEqual(await readdir(join(workspace, "outbox")), []);
+	assert.match(results[0]!, /sum=42.* error=false/);
+	assert.match(results[1]!, /it broke.* error=true/);
+	// Arguments that do not fit the server's schema never reach it.
+	assert.match(results[2]!, /error=true/);
+	assert.doesNotMatch(results[2]!, /sum=/);
+	assert.match(listing, /\*\*calc\*\*: 2 tools \(add, fail\)/);
+	assert.match(listing, /\*\*gone\*\*: not connected \(/);
+	assert.match(listing, /\*\*off\*\*: not connected \(disabled\)/);
+	assert.deepEqual(transport.commands[0], [...COMMANDS.slice(0, -1), { command: "mcp", description: "The services I am connected to" }, ...COMMANDS.slice(-1)]);
 	await transport.close();
 });
 
-test("in voice mode, sends what does not work in speech as text and falls back to text without a voice", async () => {
+test("commands and MCP servers are started without the process's secrets", async () => {
 	const transport = fakeTransport();
-	const workspace = join(directory, "voice-workspace");
+	const workspace = join(directory, "env-workspace");
 	await mkdir(workspace, { recursive: true });
-	let broken = false;
-	const { agent, faux } = await start("voice", await transport.listen(), {
-		workspace,
-		speak: async (text) => {
-			if (broken) throw new Error("no voice today");
-			return new TextEncoder().encode(text);
-		},
-	});
+	process.env.GLAV_TEST_SECRET = "hunter2";
+	const toolEnv = { ...process.env };
+	delete toolEnv.GLAV_TEST_SECRET;
+	const server = { command: process.execPath, args: [join(import.meta.dirname, "mcp-server.mjs")], env: { PREFIX: "${GLAV_TEST_SECRET}:" } };
+	// The first server gets the secret because its entry names it; the second names nothing.
+	const mcp = await connectMcp({ named: server, plain: { ...server, env: {} } }, toolEnv);
+	const { agent, faux } = await start("env", await transport.listen(), { workspace, toolEnv, extensions: [mcp.extension!] });
+	const results: string[] = [];
+	const record = (context: { messages: { role: string; content: unknown }[] }) => {
+		results.push(JSON.stringify(context.messages.filter((message) => message.role === "toolResult").map((message) => message.content)));
+		return fauxAssistantMessage("done");
+	};
 	faux.setResponses([
-		fauxAssistantMessage([fauxToolCall("send_text", { markdown: "```sh\nls -la\n```" })], { stopReason: "toolUse" }),
-		fauxAssistantMessage("I sent you the command as text."),
-		fauxAssistantMessage("Spoken, but the voice is down."),
+		fauxAssistantMessage(
+			[
+				fauxToolCall("bash", { command: 'echo "shell=[$GLAV_TEST_SECRET] path=${PATH:+set}"' }),
+				fauxToolCall("mcp__named__add", { a: 1, b: 1 }),
+				fauxToolCall("mcp__plain__add", { a: 1, b: 1 }),
+			],
+			{ stopReason: "toolUse" },
+		),
+		record,
 	]);
 
-	await inbound(agent, { update_id: 1, chat_id: 13, text: "/tts on" });
+	await inbound(agent, { update_id: 1, chat_id: 15, text: "go" });
 	await transport.until(() => transport.sent.length === 1);
-	await inbound(agent, { update_id: 2, chat_id: 13, text: "how do I list files?" });
-	await transport.until(() => transport.voices.length === 1);
-	broken = true;
-	await inbound(agent, { update_id: 3, chat_id: 13, text: "again" });
-	await transport.until(() => transport.sent.length === 3);
 	await agent.close();
+	await mcp.close();
 
-	assert.deepEqual(
-		transport.sent.slice(1).map((message) => message.text),
-		["```sh\nls -la\n```", "Spoken, but the voice is down."],
-	);
-	assert.deepEqual(
-		transport.voices.map((voice) => voice.caption),
-		["I sent you the command as text."],
-	);
+	assert.match(results[0]!, /shell=\[\] path=set/);
+	assert.match(results[0]!, /"hunter2:2"/);
+	assert.match(results[0]!, /"text":"2"/);
 	await transport.close();
 });

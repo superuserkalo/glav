@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -29,22 +28,10 @@ func newTelegram(t *testing.T, answers map[string]string) *telegram {
 			return
 		}
 		method := strings.TrimPrefix(r.URL.Path, "/bot/")
+		r.ParseForm()
 		form := map[string]string{}
-		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
-			r.ParseMultipartForm(1 << 20)
-			for k := range r.MultipartForm.Value {
-				form[k] = r.FormValue(k)
-			}
-			for k, files := range r.MultipartForm.File {
-				f, _ := files[0].Open()
-				data, _ := io.ReadAll(f)
-				form[k] = string(data)
-			}
-		} else {
-			r.ParseForm()
-			for k := range r.PostForm {
-				form[k] = r.PostForm.Get(k)
-			}
+		for k := range r.PostForm {
+			form[k] = r.PostForm.Get(k)
 		}
 		tg.calls = append(tg.calls, method)
 		tg.forms[method] = append(tg.forms[method], form)
@@ -80,8 +67,7 @@ func newAgent(t *testing.T) *agent {
 }
 
 func newBot(t *testing.T, tg *telegram, a *agent) *bot {
-	dir := t.TempDir()
-	b := &bot{secret: "s3cret", apiBase: tg.URL + "/bot/", inboxDir: filepath.Join(dir, "inbox"), outboxDir: filepath.Join(dir, "outbox"), allowed: map[int64]bool{7: true}, turnedAway: map[int64]bool{}}
+	b := &bot{secret: "s3cret", apiBase: tg.URL + "/bot/", inboxDir: t.TempDir(), allowed: map[int64]bool{7: true}, turnedAway: map[int64]bool{}}
 	if a != nil {
 		b.agentUrl = a.URL
 	}
@@ -218,13 +204,21 @@ func TestHandleForwardsOnlyAllowedUsers(t *testing.T) {
 	message := func(from int64, chat int64, text string) Update {
 		return Update{UpdateID: 1, Message: &Message{From: &From{ID: from}, Chat: &Chat{ID: chat}, Text: text}}
 	}
-	for _, u := range []Update{message(7, 7, "hi"), message(8, 8, "let me in"), message(8, 8, "again"), message(8, -100, "in a group")} {
+	b.allowed[-200] = true
+	updates := []Update{
+		message(7, 7, "hi"), message(8, 8, "let me in"), message(8, 8, "again"), message(8, -100, "in a group"),
+		// An allowed user in a group that is not listed: the answer would be read by everyone there.
+		message(7, -100, "allowed user, other group"),
+		message(7, -200, "allowed user, listed group"),
+		message(8, -200, "stranger, listed group"),
+	}
+	for _, u := range updates {
 		if err := b.handle(u); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if len(a.got) != 1 || a.got[0].Text != "hi" || a.got[0].ChatID != 7 {
+	if len(a.got) != 2 || a.got[0].Text != "hi" || a.got[0].ChatID != 7 || a.got[1].Text != "allowed user, listed group" || a.got[1].ChatID != -200 {
 		t.Errorf("forwarded %+v", a.got)
 	}
 	// The stranger is told once, in private, and learns their ID.
@@ -365,34 +359,5 @@ func TestSharedSecret(t *testing.T) {
 	b.handle(Update{UpdateID: 1, Message: &Message{From: &From{ID: 7}, Chat: &Chat{ID: 7}, Text: "hi"}})
 	if len(a.auth) != 1 || a.auth[0] != "Bearer s3cret" {
 		t.Errorf("forwarded with Authorization %q", a.auth)
-	}
-}
-
-func TestVoiceHandler(t *testing.T) {
-	tg := newTelegram(t, nil)
-	b := newBot(t, tg, nil)
-	os.MkdirAll(b.outboxDir, 0o700)
-	voice := filepath.Join(b.outboxDir, "a.ogg")
-	os.WriteFile(voice, []byte("opus bytes"), 0o600)
-	secret := filepath.Join(filepath.Dir(b.outboxDir), "secret.txt")
-	os.WriteFile(secret, []byte("private"), 0o600)
-	body := func(path string) string {
-		data, _ := json.Marshal(Voice{ChatID: 42, Path: path, Caption: "what I said"})
-		return string(data)
-	}
-
-	if rec := post(b.voiceHandler, body(voice)); rec.Code != http.StatusOK {
-		t.Errorf("status %d, want 200", rec.Code)
-	}
-	if form := tg.forms["sendVoice"][0]; form["chat_id"] != "42" || form["voice"] != "opus bytes" || form["caption"] != "what I said" {
-		t.Errorf("sendVoice form = %v", form)
-	}
-	for _, path := range []string{secret, filepath.Join(b.outboxDir, "..", "secret.txt"), "/etc/passwd", filepath.Join(b.outboxDir, "missing.ogg")} {
-		if rec := post(b.voiceHandler, body(path)); rec.Code != http.StatusBadRequest {
-			t.Errorf("%s: status %d, want 400", path, rec.Code)
-		}
-	}
-	if len(tg.calls) != 1 {
-		t.Errorf("Telegram calls: %v", tg.calls)
 	}
 }
