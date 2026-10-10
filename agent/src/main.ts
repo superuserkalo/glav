@@ -10,6 +10,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 
 import { startAgent } from "./agent.ts";
 import { connectMcp, type McpServerConfig } from "./mcp.ts";
+import { spokenAs } from "./speech.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const envFile = resolve(here, "../../.env");
@@ -32,16 +33,20 @@ if (!secret) throw new Error("agent_secret is not set in .env. Generate one with
 
 /** Speech to text through OpenAI, which takes Telegram's OGG voice notes as they are. */
 async function transcribe(path: string, mime: string | undefined): Promise<string> {
+	return transcribeAudio(await readFile(path), mime ?? "audio/ogg", basename(path));
+}
+
+async function transcribeAudio(audio: Uint8Array, mime: string, name: string): Promise<string> {
 	const form = new FormData();
 	form.set("model", process.env.transcribe_model ?? "gpt-transcribe");
-	form.set("file", new Blob([await readFile(path)], { type: mime ?? "audio/ogg" }), basename(path));
+	form.set("file", new Blob([audio as Uint8Array<ArrayBuffer>], { type: mime }), name);
 	const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
 		method: "POST",
 		headers: { authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
 		body: form,
 		signal: AbortSignal.timeout(120_000),
 	});
-	if (!response.ok) throw new Error(`transcription failed with ${response.status}: ${(await response.text()).slice(0, 300)}`);
+	if (!response.ok) throw new Error(`transcription failed with ${response.status}`);
 	return ((await response.json()) as { text: string }).text;
 }
 
@@ -64,16 +69,15 @@ async function speakPlain(text: string, model: string): Promise<Uint8Array> {
 		body: JSON.stringify({ model, voice: ttsVoice, input: text.slice(0, 4000), response_format: "opus" }),
 		signal: AbortSignal.timeout(120_000),
 	});
-	if (!response.ok) throw new Error(`speech failed with ${response.status}: ${(await response.text()).slice(0, 300)}`);
+	if (!response.ok) throw new Error(`speech failed with ${response.status}`);
 	return new Uint8Array(await response.arrayBuffer());
 }
 
-const words = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).filter(Boolean);
-
 /**
  * Text to speech with an audio chat model, which sounds better but is a chat model: left alone it answers the text
- * instead of reading it. The text goes in as the system prompt's script, and what the model reports having said must
- * match it, or the dedicated speech model reads it instead.
+ * instead of reading it. The text goes in as the system prompt's script. What the model reports having said must match
+ * it, and so must what is heard when its audio is transcribed again, since the report and the audio are produced
+ * separately. Otherwise the dedicated speech model reads the text instead. The log gets the scores, never the words.
  */
 async function speak(text: string): Promise<Uint8Array> {
 	if (!ttsModel.startsWith("gpt-audio")) return speakPlain(text, ttsModel);
@@ -96,18 +100,19 @@ async function speak(text: string): Promise<Uint8Array> {
 			}),
 			signal: AbortSignal.timeout(180_000),
 		});
-		if (!response.ok) throw new Error(`${response.status}: ${(await response.text()).slice(0, 300)}`);
+		if (!response.ok) throw new Error(`status ${response.status}`);
 		const audio = ((await response.json()) as { choices: { message: { audio?: { data: string; transcript: string } } }[] }).choices[0]
 			?.message.audio;
 		if (!audio) throw new Error("no audio in the response");
-		const wanted = words(script);
-		const said = new Set(words(audio.transcript));
-		const kept = wanted.filter((word) => said.has(word)).length / Math.max(wanted.length, 1);
-		const length = words(audio.transcript).length / Math.max(wanted.length, 1);
-		if (kept < 0.9 || length < 0.8 || length > 1.2) throw new Error(`it did not read the text (said: ${audio.transcript.slice(0, 120)})`);
-		return new Uint8Array(Buffer.from(audio.data, "base64"));
+		const reported = spokenAs(script, audio.transcript);
+		if (reported < 0.9) throw new Error(`it did not read the text (reported match ${reported.toFixed(2)})`);
+		const bytes = new Uint8Array(Buffer.from(audio.data, "base64"));
+		// Looser than the report: a transcription writes numbers and names its own way.
+		const heard = spokenAs(script, await transcribeAudio(bytes, "audio/ogg", "speech.ogg"));
+		if (heard < 0.75) throw new Error(`its audio did not match the text (heard match ${heard.toFixed(2)})`);
+		return bytes;
 	} catch (error) {
-		console.error(`${ttsModel} speech failed, using gpt-4o-mini-tts:`, error);
+		console.error(`${ttsModel} speech failed, using gpt-4o-mini-tts: ${error instanceof Error ? error.message : "unknown error"}`);
 		return speakPlain(text, "gpt-4o-mini-tts");
 	}
 }
