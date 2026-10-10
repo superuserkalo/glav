@@ -89,6 +89,13 @@ type Draft struct {
 	Text string `json:"text"`
 }
 
+// Voice is what the agent posts to /voice: an OGG Opus file it wrote to the outbox.
+type Voice struct {
+	ChatID int64 `json:"chat_id"`
+	Path string `json:"path"`
+	Caption string `json:"caption"`
+}
+
 type Command struct {
 	Command string `json:"command"`
 	Description string `json:"description"`

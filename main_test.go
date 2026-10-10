@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,10 +29,22 @@ func newTelegram(t *testing.T, answers map[string]string) *telegram {
 			return
 		}
 		method := strings.TrimPrefix(r.URL.Path, "/bot/")
-		r.ParseForm()
 		form := map[string]string{}
-		for k := range r.PostForm {
-			form[k] = r.PostForm.Get(k)
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+			r.ParseMultipartForm(1 << 20)
+			for k := range r.MultipartForm.Value {
+				form[k] = r.FormValue(k)
+			}
+			for k, files := range r.MultipartForm.File {
+				f, _ := files[0].Open()
+				data, _ := io.ReadAll(f)
+				form[k] = string(data)
+			}
+		} else {
+			r.ParseForm()
+			for k := range r.PostForm {
+				form[k] = r.PostForm.Get(k)
+			}
 		}
 		tg.calls = append(tg.calls, method)
 		tg.forms[method] = append(tg.forms[method], form)
@@ -67,7 +80,8 @@ func newAgent(t *testing.T) *agent {
 }
 
 func newBot(t *testing.T, tg *telegram, a *agent) *bot {
-	b := &bot{secret: "s3cret", apiBase: tg.URL + "/bot/", inboxDir: t.TempDir(), allowed: map[int64]bool{7: true}, turnedAway: map[int64]bool{}}
+	dir := t.TempDir()
+	b := &bot{secret: "s3cret", apiBase: tg.URL + "/bot/", inboxDir: filepath.Join(dir, "inbox"), outboxDir: filepath.Join(dir, "outbox"), allowed: map[int64]bool{7: true}, turnedAway: map[int64]bool{}}
 	if a != nil {
 		b.agentUrl = a.URL
 	}
@@ -359,5 +373,38 @@ func TestSharedSecret(t *testing.T) {
 	b.handle(Update{UpdateID: 1, Message: &Message{From: &From{ID: 7}, Chat: &Chat{ID: 7}, Text: "hi"}})
 	if len(a.auth) != 1 || a.auth[0] != "Bearer s3cret" {
 		t.Errorf("forwarded with Authorization %q", a.auth)
+	}
+}
+
+func TestVoiceHandler(t *testing.T) {
+	tg := newTelegram(t, nil)
+	b := newBot(t, tg, nil)
+	os.MkdirAll(b.outboxDir, 0o700)
+	voice := filepath.Join(b.outboxDir, "a.ogg")
+	os.WriteFile(voice, []byte("opus bytes"), 0o600)
+	secret := filepath.Join(filepath.Dir(b.outboxDir), "secret.txt")
+	os.WriteFile(secret, []byte("private"), 0o600)
+	body := func(path string) string {
+		data, _ := json.Marshal(Voice{ChatID: 42, Path: path, Caption: "what I said"})
+		return string(data)
+	}
+
+	if rec := post(b.voiceHandler, body(voice)); rec.Code != http.StatusOK {
+		t.Errorf("status %d, want 200", rec.Code)
+	}
+	if form := tg.forms["sendVoice"][0]; form["chat_id"] != "42" || form["voice"] != "opus bytes" || form["caption"] != "what I said" {
+		t.Errorf("sendVoice form = %v", form)
+	}
+	link := filepath.Join(b.outboxDir, "link.ogg")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{secret, link, filepath.Join(b.outboxDir, "..", "secret.txt"), "/etc/passwd", filepath.Join(b.outboxDir, "missing.ogg")} {
+		if rec := post(b.voiceHandler, body(path)); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400", path, rec.Code)
+		}
+	}
+	if len(tg.calls) != 1 {
+		t.Errorf("Telegram calls: %v", tg.calls)
 	}
 }

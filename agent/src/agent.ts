@@ -1,17 +1,21 @@
 import { timingSafeEqual } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { awaitWithContext, BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
-import type { AssistantMessage, ImageContent, Models, ModelThinkingLevel, TextContent } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type ImageContent, type Models, type ModelThinkingLevel, type TextContent, Type } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
 	type Conversation,
 	type ConversationId,
 	createRegistry,
 	defineDoc,
+	defineExtension,
+	defineTool,
 	type Extension,
+	section,
 	Harness,
 	LiveDoc,
 	type LiveState,
@@ -27,6 +31,8 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 const REMEMBERED = 500;
 /** Telegram keeps "typing" for 5 seconds and a draft for 30, so an unchanged one is sent again this often. */
 const DRAFT_REFRESH_MS = 4000;
+/** Telegram's limit for the caption of a voice message. */
+const MAX_CAPTION = 1024;
 const THINKING_LEVELS: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export const COMMANDS = [
@@ -34,6 +40,7 @@ export const COMMANDS = [
 	{ command: "stop", description: "Stop what I am doing" },
 	{ command: "model", description: "Show or change the model" },
 	{ command: "thinking", description: "Show or change how hard I think" },
+	{ command: "tts", description: "Voice mode: I answer with voice messages. On or off" },
 	{ command: "compact", description: "Summarize older messages to free up context" },
 	{ command: "usage", description: "Tokens and cost of this conversation" },
 	{ command: "help", description: "List the commands" },
@@ -51,6 +58,8 @@ type ChatState = {
 	/** Set with /model and /thinking; absent follows the process settings. */
 	model?: ModelRef;
 	thinking?: string;
+	/** Set with /tts: answers are spoken, and what does not work in speech is sent as text beside them. */
+	tts?: boolean;
 };
 
 const Bot = defineDoc<{ chats: Record<string, ChatState> }>({
@@ -97,6 +106,8 @@ export type AgentOptions = {
 	extensions?: readonly Extension[];
 	/** What /mcp answers. Absent: no such command. */
 	describeMcp?: () => string;
+	/** Turns an answer into OGG Opus speech. Absent: no /tts. Needs a `workspace`, where the transport reads the file. */
+	speak?: (text: string) => Promise<Uint8Array>;
 	/** Longest pause between attempts to hand a reply to the transport. */
 	maxSendWaitMs?: number;
 	/** Shortest pause between two updates of a streamed draft. */
@@ -129,6 +140,7 @@ function textOf(message: Pick<AssistantMessage, "content"> | undefined): string 
 /** Open the storage, pick up what the last process left, and serve `POST /inbound`. */
 export async function startAgent(options: AgentOptions): Promise<RunningAgent> {
 	const { models, transportUrl, workspace, transcribe } = options;
+	const speak = workspace ? options.speak : undefined;
 	const maxSendWaitMs = options.maxSendWaitMs ?? 60_000;
 	const draftIntervalMs = options.draftIntervalMs ?? 1000;
 	const context = BACKGROUND_CONTEXT;
@@ -142,6 +154,37 @@ export async function startAgent(options: AgentOptions): Promise<RunningAgent> {
 		);
 	}
 
+	/** Conversation to chat, for tools that act on the chat they run in. */
+	const chatOf = new Map<ConversationId, string>();
+
+	/** What a conversation gets while its chat is in voice mode. */
+	const Voice = defineExtension({
+		name: "voice",
+		sections: [
+			section("voice", () =>
+				[
+					"Voice mode is on: your reply is read aloud to the user as a voice message, so write it the way you would say it.",
+					"Use plain spoken sentences: no Markdown, no lists, no code, no file contents, no tables, no links, and nothing else that is awkward to hear. Keep it short.",
+					"When there is material that does not work in speech, such as code, commands, command output, tables, long lists or links, do not read it out. Either send it with the send_text tool and say in your reply that you sent it as text, or, when the user may not need it, describe it briefly and ask whether they want it sent. When they say yes, send it with send_text.",
+				].join("\n"),
+			),
+		],
+		tools: [
+			defineTool({
+				name: "send_text",
+				description:
+					"Send the user a text message in this chat, beside your spoken reply. For what does not work in speech: code, commands, output, tables, long lists, links. Takes Markdown.",
+				parameters: Type.Object({ markdown: Type.String({ description: "The message, formatted with Markdown" }) }),
+				execute: async (args, api) => {
+					const chatId = chatOf.get(api.conversationId);
+					if (!chatId || !args.markdown.trim()) return { content: [{ type: "text", text: "Nothing was sent." }], isError: true };
+					await inOrder(sends, chatId, () => send(chatId, args.markdown));
+					return { content: [{ type: "text", text: "Sent. Mention in your spoken reply that you sent it as text." }] };
+				},
+			}),
+		],
+	});
+
 	/**
 	 * The shell's environment is laid over this process's, so what `toolEnv` leaves out has to be named as undefined to
 	 * be left out of the shell too.
@@ -154,6 +197,7 @@ export async function startAgent(options: AgentOptions): Promise<RunningAgent> {
 
 	const registry = createRegistry();
 	if (workspace) registry.install(CodingTools);
+	if (speak) registry.install(Voice);
 	for (const extension of options.extensions ?? []) registry.install(extension);
 	const commands = options.describeMcp
 		? [...COMMANDS.slice(0, -1), { command: "mcp", description: "The services I am connected to" }, ...COMMANDS.slice(-1)]
@@ -192,8 +236,10 @@ export async function startAgent(options: AgentOptions): Promise<RunningAgent> {
 		return (await harness.snapshot(Bot, context))?.chats[chatId];
 	}
 
-	function agentFor(state: Pick<ChatState, "model" | "thinking"> | undefined) {
+	function agentFor(state: Pick<ChatState, "model" | "thinking" | "tts"> | undefined) {
 		return {
+			// Every installed extension, and the voice one only in voice mode.
+			extensions: state?.tts ? null : { remove: [Voice] },
 			model: state?.model ?? defaultModel,
 			thinkingLevel: (state?.thinking as ModelThinkingLevel | undefined) ?? null,
 			instructions: options.instructions,
@@ -224,6 +270,7 @@ export async function startAgent(options: AgentOptions): Promise<RunningAgent> {
 				configured.add(chatId);
 			}
 		}
+		chatOf.set(conversation.id, chatId);
 		await present(chatId, conversation);
 		return conversation;
 	}
@@ -302,7 +349,10 @@ export async function startAgent(options: AgentOptions): Promise<RunningAgent> {
 						const message = entry?.model?.[0] as AssistantMessage | undefined;
 						text = textOf(message).trim() || message?.errorMessage || "(empty reply)";
 					}
-					if (text !== undefined) await send(chatId, text);
+					// In voice mode the answer is the voice message, with its words as the caption when they fit. The text
+					// goes out as a message of its own when they do not, or when there is no voice message after all.
+					const voiced = text !== undefined && answer !== undefined && (await chatState(chatId))?.tts && (await sendVoice(chatId, text, answer));
+					if (text !== undefined && !(voiced && text.length <= MAX_CAPTION)) await send(chatId, text);
 					await harness.commit(async (tx) => {
 						const chat = (await tx.doc(Bot)).chats[chatId];
 						if (!chat) return;
@@ -355,6 +405,25 @@ export async function startAgent(options: AgentOptions): Promise<RunningAgent> {
 				console.error(`chat ${chatId}: transport unreachable, retrying in ${wait} ms:`, error);
 			}
 			await awaitWithContext(new Promise((done) => setTimeout(done, wait)), waits.context);
+		}
+	}
+
+	/** Best effort: false when there is no voice message, and the answer has to go out as text. */
+	async function sendVoice(chatId: string, text: string, answer: number): Promise<boolean> {
+		if (!speak || !workspace) return false;
+		const path = join(workspace, "outbox", `${chatId}_${answer}.ogg`);
+		try {
+			await mkdir(join(workspace, "outbox"), { recursive: true });
+			await writeFile(path, await speak(text));
+			const caption = text.length <= MAX_CAPTION ? text : undefined;
+			const response = await post("/voice", { chat_id: Number(chatId), path, caption }, 120_000);
+			if (!response.ok) console.error(`chat ${chatId}: voice message refused with ${response.status}: ${(await response.text()).trim()}`);
+			return response.ok;
+		} catch (error) {
+			console.error(`chat ${chatId}: voice message failed:`, error);
+			return false;
+		} finally {
+			await rm(path, { force: true });
 		}
 	}
 
@@ -432,11 +501,11 @@ export async function startAgent(options: AgentOptions): Promise<RunningAgent> {
 	}
 
 	/** Keep a /model or /thinking choice for the chat and apply it from the next request on. */
-	async function change(chatId: string, conversation: Conversation, choice: Pick<ChatState, "model" | "thinking">): Promise<void> {
+	async function change(chatId: string, conversation: Conversation, choice: Pick<ChatState, "model" | "thinking" | "tts">): Promise<void> {
 		const state = await harness.commit(async (tx) => {
 			const chat = (await tx.doc(Bot)).chats[chatId]!;
 			Object.assign(chat, choice);
-			return { model: chat.model && { ...chat.model }, thinking: chat.thinking };
+			return { model: chat.model && { ...chat.model }, thinking: chat.thinking, tts: chat.tts };
 		}, context);
 		await conversation.configure(agentFor(state), context);
 	}
@@ -476,6 +545,20 @@ export async function startAgent(options: AgentOptions): Promise<RunningAgent> {
 				await conversation.reset(undefined, context);
 				say(chatId, "Started a fresh conversation.");
 				break;
+			case "tts": {
+				if (!speak) {
+					say(chatId, "Voice answers are not set up.");
+					break;
+				}
+				const on = arg === "on" || (arg === "" && !(await chatState(chatId))?.tts);
+				if (arg !== "" && arg !== "on" && arg !== "off") {
+					say(chatId, "Use /tts on or /tts off.");
+					break;
+				}
+				await change(chatId, conversation, { tts: on });
+				say(chatId, on ? "Voice mode on. I'll answer with voice messages, and send code and the like as text." : "Voice mode off.");
+				break;
+			}
 			case "compact":
 				await conversation.compact(arg || undefined, context);
 				say(chatId, "Summarizing the older part of this conversation.");
