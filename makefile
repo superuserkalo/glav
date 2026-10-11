@@ -1,14 +1,14 @@
-.PHONY: run agent build test
+.PHONY: run build deploy test
 
 run:
-	@go run .
-
-agent:
-	@cd agent && npm start
+	@npm run dev
 
 build:
-	go build -o glav .
+	@npm run build
+
+deploy:
+	@npm run deploy
 
 test:
-	go test .
-	cd agent && npm run typecheck && npm test
+	@npm run typecheck
+	@npm test

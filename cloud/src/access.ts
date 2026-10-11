@@ -3,9 +3,10 @@ import { Trials, type Campaign, type TrialResult } from "./trials.ts";
 export function allowedUsers(value: string | undefined): Set<number> {
 	return new Set((value ?? "").split(/[,\s]+/).filter(Boolean).map(Number));
 }
-export type AccessEnv = { ALLOWED_USERS?: string; BETA_MODE?: string; FREE_MESSAGES?: string };
+export type DeploymentMode = "hosted" | "self-hosted";
+export type AccessEnv = { DEPLOYMENT_MODE?: DeploymentMode; ALLOWED_USERS?: string; BETA_MODE?: string; FREE_MESSAGES?: string };
 export type AccessSettings = { betaMode: boolean; waitlistEnabled: boolean; codesEnabled: boolean; freeMessages: number; betaCampaign: string; subscriptionMonthlyUsd: number };
-export type AccessState = { tier: "permanent" | "subscription" | "trial" | "free" | "closed"; agent: boolean; freeUsed: number; freeRemaining: number;
+export type AccessState = { deploymentMode: DeploymentMode; tier: "permanent" | "subscription" | "trial" | "free" | "closed"; agent: boolean; freeUsed: number; freeRemaining: number;
 	trial?: { startedAt: number; endsAt: number }; subscriptionEndsAt?: number; waitlisted: boolean; settings: AccessSettings; campaign?: Campaign };
 const TABLES = [
 	`CREATE TABLE IF NOT EXISTS access_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
@@ -20,15 +21,24 @@ const TABLES = [
 /** Admission, free-message accounting, and product flags share one authoritative interface. No container is started here. */
 export class Access {
 	readonly trials: Trials;
+	readonly deploymentMode: DeploymentMode;
 	private readonly db: D1Database;
 	private readonly env: AccessEnv;
 	private readonly now: () => number;
 	private ready?: Promise<unknown>;
-	constructor(db: D1Database, env: AccessEnv = {}, now: () => number = Date.now) { this.db = db; this.env = env; this.now = now; this.trials = new Trials(db, now); }
+	constructor(db: D1Database, env: AccessEnv = {}, now: () => number = Date.now) {
+		this.deploymentMode = env.DEPLOYMENT_MODE ?? "hosted";
+		if (!["hosted", "self-hosted"].includes(this.deploymentMode)) throw new RangeError("DEPLOYMENT_MODE must be hosted or self-hosted.");
+		this.db = db; this.env = env; this.now = now; this.trials = new Trials(db, now);
+	}
 	private ensure(): Promise<unknown> {
 		return this.ready ??= this.db.batch(TABLES.map((sql) => this.db.prepare(sql))).catch((error) => { this.ready = undefined; throw error; });
 	}
 	async settings(patch: Partial<AccessSettings> = {}): Promise<AccessSettings> {
+		if (this.deploymentMode === "self-hosted") {
+			if (Object.keys(patch).length) throw new RangeError("Commercial access settings are only available in hosted deployments.");
+			return { betaMode: false, waitlistEnabled: false, codesEnabled: false, freeMessages: 0, betaCampaign: "launch", subscriptionMonthlyUsd: 0 };
+		}
 		const defaults: AccessSettings = { betaMode: this.env.BETA_MODE !== "false", waitlistEnabled: true, codesEnabled: true,
 			freeMessages: Number(this.env.FREE_MESSAGES ?? 20), betaCampaign: "launch", subscriptionMonthlyUsd: 25 };
 		for (const [key, value] of Object.entries(patch)) {
@@ -47,6 +57,9 @@ export class Access {
 		const settings = await this.settings();
 		const privateChat = userId === chatId && userId > 0;
 		const permanent = allowedUsers(this.env.ALLOWED_USERS).has(userId) && allowedUsers(this.env.ALLOWED_USERS).has(chatId);
+		// Self-hosted credentials belong to the operator. Stored commercial grants never widen their allowlist.
+		if (this.deploymentMode === "self-hosted") return { deploymentMode: this.deploymentMode, tier: permanent ? "permanent" : "closed",
+			agent: permanent, freeUsed: 0, freeRemaining: 0, waitlisted: false, settings };
 		const [trial, subscription, free, waiting, campaign] = await Promise.all([
 			privateChat ? this.trials.access(userId) : undefined,
 			privateChat ? this.db.prepare("SELECT ends_at FROM access_subscriptions WHERE user_id = ? AND ends_at > ?").bind(userId, this.now()).first<{ ends_at: number }>() : null,
@@ -56,7 +69,7 @@ export class Access {
 		]);
 		const freeUsed = free?.used ?? 0, freeRemaining = privateChat ? Math.max(0, settings.freeMessages - freeUsed) : 0;
 		const tier = permanent ? "permanent" : subscription ? "subscription" : trial ? "trial" : freeRemaining > 0 ? "free" : "closed";
-		return { tier, agent: ["permanent", "subscription", "trial"].includes(tier), freeUsed, freeRemaining,
+		return { deploymentMode: this.deploymentMode, tier, agent: ["permanent", "subscription", "trial"].includes(tier), freeUsed, freeRemaining,
 			trial, subscriptionEndsAt: subscription?.ends_at, waitlisted: !!waiting, settings, campaign };
 	}
 	async canRedeem(userId: number, code: string): Promise<boolean> {
@@ -70,6 +83,7 @@ export class Access {
 	}
 	/** A retry at the quota boundary still belongs to its original, already charged turn. */
 	async freeTurn(userId: number, updateId: number, reserve = false): Promise<boolean> {
+		if (this.deploymentMode === "self-hosted") return false;
 		if (!Number.isSafeInteger(userId) || userId <= 0 || !Number.isSafeInteger(updateId)) return false;
 		const settings = await this.settings();
 		if (reserve) {
@@ -90,6 +104,7 @@ export class Access {
 		}
 	}
 	async denial(userId: number): Promise<string> {
+		if (this.deploymentMode === "self-hosted") return `This bot is restricted by its operator. Ask them to add your Telegram ID (${userId}) to ALLOWED_USERS.`;
 		await this.joinWaitlist(userId);
 		const state = await this.state(userId);
 		return `${await this.trials.hasTrial(userId) ? "Your trial has ended. " : ""}You've used your ${state.settings.freeMessages} free chat messages. `
@@ -108,6 +123,7 @@ export class Access {
 	}
 	/** Called only by an authenticated operator after payment verification; no user or model can grant a subscription. */
 	async subscription(userId: number, endsAt?: number, reference?: string) {
+		if (this.deploymentMode === "self-hosted") throw new RangeError("Subscriptions are only available in hosted deployments.");
 		if (!Number.isSafeInteger(userId) || userId <= 0 || endsAt !== undefined && (!Number.isSafeInteger(endsAt) || endsAt < 0)
 			|| reference !== undefined && (typeof reference !== "string" || reference.length > 200)) throw new RangeError("Invalid subscription account or expiry.");
 		await this.ensure();
@@ -120,6 +136,7 @@ export class Access {
 }
 
 export function accessPrompt(state: AccessState, firstName?: string, introduction = false): string {
+	if (state.deploymentMode === "self-hosted") return `This is a self-hosted Glav deployment using the operator's model and Telegram credentials. Access is controlled by the operator's ALLOWED_USERS setting. Full agent access is ${state.agent ? "available" : "unavailable"} for this chat. There is no Glav subscription, free-message quota, trial, beta offer, or waitlist in this deployment; do not ask this user to buy access or activate a trial. If older conversation history mentions those offers, they no longer apply here. When asked for an available action, use your tools. Only claim work succeeded after a successful tool result. The Linux sandbox runs at /workspace.\n`;
 	const { settings, campaign } = state;
 	const facts = { firstConversationTurn: introduction, tier: state.tier, agentAvailable: state.agent, freeMessagesTotal: settings.freeMessages, freeMessagesRemaining: state.freeRemaining,
 		trialEndsAt: state.trial ? new Date(state.trial.endsAt).toISOString() : undefined,

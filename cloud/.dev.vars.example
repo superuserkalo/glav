@@ -1,0 +1,13 @@
+# Copy to .dev.vars for managed development, or .dev.vars.self-hosted for self-hosted development.
+# These credentials are loaded by the same Worker in both deployments. Keep them out of Git.
+TELEGRAM_KEY=""
+OPENAI_API_KEY=""
+WEBHOOK_SECRET=""
+AGENT_SECRET=""
+# Telegram user IDs, plus group IDs where those users may use the bot. Empty admits nobody in self-hosted mode.
+ALLOWED_USERS=""
+# Optional provider/model settings, with their defaults:
+# MODEL_PROVIDER="openai"
+# MODEL_ID="gpt-6-luna"
+# TRANSCRIBE_MODEL="gpt-transcribe"
+# SYSTEM_PROMPT="You are Glav, ..."

@@ -1,9 +1,10 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
+  "$schema": "../node_modules/wrangler/config-schema.json",
   "name": "glav",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-01",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": { "DEPLOYMENT_MODE": "hosted" },
   "durable_objects": {
     "bindings": [{ "name": "CHAT", "class_name": "Chat" }]
   },
@@ -18,5 +19,17 @@
   // Usage per chat and day, and later the accounts.
   "d1_databases": [{ "binding": "DB", "database_name": "glav", "database_id": "2161073c-8b6f-46a4-bd71-f35f1f6a77dc" }],
   "observability": { "enabled": true },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Chat"] }],
+  // Same application and sandbox image, deployed into the operator's Cloudflare account.
+  // Wrangler requires resource bindings to be repeated for a named environment.
+  "env": {
+    "self-hosted": {
+      "name": "glav-self-hosted",
+      "vars": { "DEPLOYMENT_MODE": "self-hosted", "ALLOWED_USERS": "" },
+      "durable_objects": { "bindings": [{ "name": "CHAT", "class_name": "Chat" }] },
+      "containers": [{ "class_name": "Chat", "scheduling_policy": "durable_object", "images": { "sandbox": { "dockerfile": "./Dockerfile" } } }],
+      // No managed-service database ID: Wrangler provisions this in the operator's account.
+      "d1_databases": [{ "binding": "DB", "database_name": "glav-self-hosted" }]
+    }
+  }
 }

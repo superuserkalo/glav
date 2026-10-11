@@ -8,6 +8,6 @@ RUN apt-get update \
 	&& apt-get install -y --no-install-recommends bash ca-certificates curl git jq python3 python3-pip unzip zip \
 	&& rm -rf /var/lib/apt/lists/*
 COPY --from=sandbox-tools /usr/local/bin/sandbox-shim /usr/local/bin/sandbox-shim
-RUN mkdir -p /workspace
+RUN mkdir -p /workspace/.agents/skills
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

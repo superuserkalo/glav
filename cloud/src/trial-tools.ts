@@ -22,7 +22,7 @@ export function trialTools(access: Access, current: () => Promise<TrialChat>) {
 		execute: async () => ({ content: [{ type: "text" as const, text: accessPrompt(await access.state((await current()).chatId)) }] }),
 	});
 	const extension = defineExtension({
-		name: "access", tools: [activate, status],
+		name: "access", tools: access.deploymentMode === "self-hosted" ? [status] : [activate, status],
 		sections: [section("access", async () => { const chat = await current(); return accessPrompt(await access.state(chat.chatId), chat.firstName, chat.introduction); })],
 		hooks: [
 			hook(GenerationTask, { beforeRequest: async () => {

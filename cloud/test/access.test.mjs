@@ -11,6 +11,59 @@ import { Trials, TRIAL_MS, TrialLimitError } from "../src/trials.ts";
 import { trialTools } from "../src/trial-tools.ts";
 import { database } from "./sqlite.mjs";
 
+test("self-hosted access uses only the operator's allowlist, regardless of stored hosted entitlements", async (t) => {
+	const { db } = database(t);
+	const hosted = new Access(db);
+	const [code, unused] = (await hosted.trials.issue(2)).codes;
+	await hosted.redeem(11, code);
+	await hosted.subscription(12, Date.now() + TRIAL_MS, "verified-payment");
+	await hosted.freeTurn(13, 1, true);
+	await hosted.joinWaitlist(13);
+	const access = new Access(db, { DEPLOYMENT_MODE: "self-hosted", ALLOWED_USERS: "7,-200", FREE_MESSAGES: "100" });
+	assert.equal((await access.state(7)).agent, true);
+	assert.equal((await access.state(7, -200)).agent, true);
+	for (const [user, chat] of [[11, 11], [12, 12], [13, 13], [8, -200], [7, -100]]) {
+		const state = await access.state(user, chat);
+		assert.equal(state.agent, false);
+		assert.equal(state.tier, "closed");
+		assert.equal(state.freeRemaining, 0);
+		assert.equal(state.waitlisted, false);
+	}
+	assert.equal(await access.freeTurn(13, 1), false, "hosted receipts cannot admit self-hosted turns");
+	assert.equal(await access.freeTurn(7, 2, true), false, "the operator's turns have no quota to charge");
+	assert.equal(await access.canRedeem(13, unused), false);
+	assert.equal((await access.redeem(13, unused)).status, "invalid");
+	assert.equal(await hosted.canRedeem(13, unused), true, "switching modes never consumes existing codes");
+	await assert.rejects(access.settings({ freeMessages: 20 }), /only available in hosted/);
+	await assert.rejects(access.subscription(13, Date.now() + TRIAL_MS), /only available in hosted/);
+	assert.match(await access.denial(13), /operator.*13/);
+	assert.equal((await new Access(db, { DEPLOYMENT_MODE: "self-hosted" }).state(7)).agent, false, "an empty allowlist admits nobody");
+	assert.throws(() => new Access(db, { DEPLOYMENT_MODE: "unknown" }), /DEPLOYMENT_MODE/);
+});
+
+test("self-hosted turns run the full agent with no quota or activation step", async (t) => {
+	const { db } = database(t);
+	const access = new Access(db, { DEPLOYMENT_MODE: "self-hosted", ALLOWED_USERS: "7" });
+	const extension = trialTools(access, async () => ({ chatId: 7 }));
+	assert.deepEqual(extension.extension.tools.map((tool) => tool.name), ["access_status"]);
+	const faux = fauxProvider(), models = createModels(); models.setProvider(faux.provider);
+	const registry = createRegistry(); registry.install(extension.extension);
+	let used = 0;
+	registry.install(defineExtension({ name: "computer", tools: [defineTool({ name: "bash", description: "Run commands", parameters: Type.Object({}),
+		execute: async () => { used++; return { content: [{ type: "text", text: "ran" }] }; } })] }));
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
+	t.after(() => harness.close(context));
+	const conversation = await harness.root(context);
+	await conversation.configure({ model: { provider: "faux", modelId: faux.getModel().id } }, context);
+	harness.resume();
+	faux.appendResponses([fauxAssistantMessage(fauxToolCall("bash", {}), { stopReason: "toolUse" }), fauxAssistantMessage("Done.")]);
+	assert.equal((await (await conversation.submit({ type: "input", content: "Run a command" }, context)).wait(context)).status, "done");
+	assert.equal(used, 1);
+	assert.equal((await access.state(7)).freeUsed, 0);
+	assert.match(accessPrompt(await access.state(7)), /operator's model and Telegram credentials/);
+	assert.ok(!accessPrompt(await access.state(7)).includes("plannedSubscriptionMonthlyUsd"));
+});
+
 test("20 free messages are counted once, survive reopening, and racing requests cannot buy a 21st", async (t) => {
 	const { db } = database(t);
 	const access = new Access(db);

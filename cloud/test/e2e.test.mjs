@@ -8,7 +8,15 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { promisify } from "node:util";
 
-const PORT = Number(process.env.GLAV_TEST_PORT) || 8797;
+async function availablePort() {
+	const probe = createServer();
+	await new Promise((done, failed) => { probe.once("error", failed); probe.listen(0, "127.0.0.1", done); });
+	const port = probe.address().port;
+	await new Promise((done) => probe.close(done));
+	return port;
+}
+
+const PORT = Number(process.env.GLAV_TEST_PORT) || await availablePort();
 const SECRET = "hook-secret";
 const worker = `http://127.0.0.1:${PORT}`;
 
@@ -30,13 +38,14 @@ const telegram = createServer(async (request, response) => {
 let directory;
 let wrangler;
 
-async function start() {
+async function start(environment) {
 	wrangler = spawn(
 		"npx",
-		["wrangler", "dev", "--local", "--port", String(PORT), "--persist-to", directory, "--show-interactive-dev-session=false",
+		["wrangler", "dev", "--local", "--port", String(PORT), "--inspector-port", "0", "--persist-to", directory, "--show-interactive-dev-session=false",
+			...(environment ? ["--env", environment] : []),
 			...(process.env.GLAV_TEST_NO_COMPUTER ? ["--enable-containers=false"] : []),
 			"--var", `TELEGRAM_API:http://127.0.0.1:${telegram.address().port}`, "--var", "TELEGRAM_KEY:TOKEN", "--var", `WEBHOOK_SECRET:${SECRET}`,
-			"--var", "AGENT_SECRET:setup-secret", "--var", "FREE_MESSAGES:0", "--var", "BETA_MODE:false", "--var", "ALLOWED_USERS:7,-200", "--var", "MODEL_PROVIDER:faux", "--var", "FAUX_TOKENS_PER_SECOND:60"],
+			"--var", `DEPLOYMENT_MODE:${environment ?? "hosted"}`, "--var", "AGENT_SECRET:setup-secret", "--var", "FREE_MESSAGES:0", "--var", "BETA_MODE:false", "--var", "ALLOWED_USERS:7,-200", "--var", "MODEL_PROVIDER:faux", "--var", "FAUX_TOKENS_PER_SECOND:60"],
 		{ stdio: ["ignore", "pipe", "pipe"], detached: true },
 	);
 	let output = "";
@@ -100,6 +109,20 @@ async function ask(text, from = 7, chat = from, extra = {}) {
 	return sent(chat).at(-1);
 }
 
+test("snapshot maintenance requires operator authorization and never sends Telegram messages", async () => {
+	const path = `${worker}/snapshot-retention?chat=7`;
+	assert.equal((await fetch(path, { method: "POST", body: '{"renew":true}' })).status, 401);
+	const headers = { authorization: "Bearer setup-secret" };
+	assert.equal((await fetch(`${worker}/snapshot-retention?chat=invalid`, { method: "POST", headers })).status, 400);
+	const before = calls.length;
+	const response = await fetch(path, { method: "POST", headers, body: '{"renew":true}' });
+	assert.equal(response.status, 200);
+	const status = await response.json();
+	assert.equal(status.retention, null);
+	assert.equal(status.entries, undefined);
+	assert.equal(calls.length, before);
+});
+
 test("only Telegram's secret gets a webhook call in", async () => {
 	assert.equal((await hook(message("hi"), null)).status, 401);
 	assert.equal((await hook(message("hi"), "wrong")).status, 401);
@@ -151,8 +174,8 @@ test("an allowed user is answered in a listed group, with typing instead of a dr
 
 test("commands", async () => {
 	assert.match(await ask("/help"), /\/new - Start a fresh conversation/);
-	assert.match(await ask("/model"), /^Model: echo/);
-	assert.match(await ask("/model nope"), /^I don't know nope\. Models: echo/);
+	assert.match(await ask("/model"), /^Model: faux\/echo/);
+	assert.match(await ask("/model nope"), /^I don't know faux\/nope\. Models of faux: echo/);
 	assert.match(await ask("/thinking"), /^Thinking: off/);
 	assert.equal(await ask("/thinking high"), "Thinking: high");
 	assert.match(await ask("/thinking"), /^Thinking: high/);
@@ -169,7 +192,7 @@ test("photos reach the model as images and voice notes as text", async () => {
 	const document = await ask(undefined, 7, 7, { document: { file_id: "d", file_name: "report.pdf", mime_type: "application/pdf" } });
 	assert.match(document, process.env.GLAV_TEST_NO_COMPUTER
 		? /report\.pdf, application\/pdf, \? bytes\. You have nowhere to open it/
-		: /report\.pdf, application\/pdf, saved on your computer at \/workspace\/inbox\/\d+_report\.pdf/);
+		: /report\.pdf, application\/pdf, \? bytes, saved at \/workspace\/inbox\/\d+_report\.pdf/);
 });
 
 test("a file Telegram refuses does not hold the message back", async () => {
@@ -479,4 +502,47 @@ test("free users can stop streaming replies without spending another free messag
 	await until(() => sent(204).includes("Stopped."), "a free stop acknowledgement");
 	assert.equal((await account(204)).access.freeUsed, 1);
 	assert.equal((await account(204)).access.agent, false);
+});
+
+test("the self-hosted deployment runs the same bot and sandbox with operator access and credentials", async () => {
+	await stop(); await start("self-hosted");
+	const updateId = nextUpdate;
+	assert.equal(await ask("Self-hosted work"), "echo: Self-hosted work");
+	assert.equal((await account(7)).access.deploymentMode, "self-hosted");
+	assert.equal((await account(7)).access.agent, true);
+	assert.equal((await account(7)).access.freeUsed, 0);
+	assert.equal(await ask("Self-hosted group", 7, -200), "echo: Self-hosted group");
+	const answer = await ask(undefined, 7, 7, { document: { file_id: "self-hosted-file", file_name: "self-hosted.txt", mime_type: "text/plain" } });
+	assert.match(answer, process.env.GLAV_TEST_NO_COMPUTER ? /nowhere to open it/ : /saved at \/workspace\/inbox\/\d+_self-hosted\.txt/);
+	assert.match(await ask("/model"), /^Model: faux\/echo/);
+	await stop(); await start("self-hosted");
+	const replies = sent(7).length;
+	nextUpdate = updateId;
+	await hook(message("Self-hosted work"));
+	await new Promise((tick) => setTimeout(tick, 200));
+	assert.equal(sent(7).length, replies, "self-hosted restarts preserve the same durable delivery receipts");
+	nextUpdate += 10;
+});
+
+test("self-hosted access cannot be purchased, redeemed, or bypassed by callbacks, groups, or stops", async () => {
+	const before = calls.length;
+	await hook(message(`Activate GLAV-${"0".repeat(32)}`, 900, 900, { voice: { file_id: "must-not-download" } }));
+	await hook(message("/stop", 900));
+	await hook(message("stranger in allowed group", 900, -200));
+	await hook(message("operator in unlisted group", 7, -100));
+	await hook(click("details", 900));
+	await hook({ stopped_message_generation: { chat: { id: 900 } } });
+	await new Promise((tick) => setTimeout(tick, 200));
+	const made = calls.slice(before);
+	assert.deepEqual(made.map((call) => call.method), ["sendMessage", "sendMessage"]);
+	assert.ok(made.every((call) => /restricted by its operator/.test(call.text)));
+	const stranger = await account(900);
+	assert.equal(stranger.access, null, "rejected updates never create a chat identity");
+	assert.equal(stranger.running, false);
+	assert.deepEqual(stranger.pending, []);
+	assert.equal(stranger.computer.running, false);
+	for (const endpoint of ["trial-codes", "subscriptions", "access-settings", "campaigns", "waitlist"]) {
+		assert.equal((await fetch(`${worker}/${endpoint}`, { method: "POST", body: "{}" })).status, 401);
+		assert.equal((await fetch(`${worker}/${endpoint}`, { method: "POST", headers: { authorization: "Bearer setup-secret" }, body: "{}" })).status, 409);
+	}
 });

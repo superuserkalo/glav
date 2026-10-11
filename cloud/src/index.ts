@@ -59,7 +59,7 @@ async function route(update: Update, env: Env): Promise<Inbound | undefined> {
 	const privateAccess = async (userId: number, chatId: number) => userId === chatId && (await access.state(userId)).agent;
 	const stopped = update.stopped_message_generation?.chat?.id;
 	// Drafts exist only in private chats, where the chat ID is the user's ID.
-	if (stopped !== undefined) return stopped > 0 || users.has(stopped) ? { updateId: update.update_id, chatId: stopped, stop: true } : undefined;
+	if (stopped !== undefined) return (access.deploymentMode === "self-hosted" ? users.has(stopped) : stopped > 0 || users.has(stopped)) ? { updateId: update.update_id, chatId: stopped, stop: true } : undefined;
 
 	const callback = update.callback_query;
 	if (callback) {
@@ -78,8 +78,12 @@ async function route(update: Update, env: Env): Promise<Inbound | undefined> {
 	const message = update.message;
 	if (!message?.chat || !message.from) return undefined;
 	const privateChat = message.chat.id === message.from.id && message.from.id > 0;
-	const trialCode = privateChat ? trialCodeIn(message.text ?? message.caption) : undefined;
+	const trialCode = privateChat && access.deploymentMode === "hosted" ? trialCodeIn(message.text ?? message.caption) : undefined;
 	const permanent = users.has(message.from.id) && users.has(message.chat.id);
+	if (access.deploymentMode === "self-hosted" && !permanent) {
+		if (privateChat) await new Telegram(env.TELEGRAM_KEY, env.TELEGRAM_API).call("sendMessage", { chat_id: String(message.chat.id), text: await access.denial(message.from.id) }).catch(() => undefined);
+		return undefined;
+	}
 	const account = await access.state(message.from.id, message.chat.id);
 	const active = account.agent;
 	if (message.text?.trim() === "/stop" && (privateChat || permanent)) return { updateId: update.update_id, chatId: message.chat.id, stop: true };
@@ -133,6 +137,7 @@ export default {
 		// Only the operator can mint codes. Cleartext is returned once; D1 stores hashes.
 		if (url.pathname === "/trial-codes") {
 			if (!same(request.headers.get("authorization"), env.AGENT_SECRET && `Bearer ${env.AGENT_SECRET}`)) return new Response("unauthorized", { status: 401 });
+			if (new Access(env.DB, env).deploymentMode === "self-hosted") return new Response("Commercial access controls are disabled in self-hosted deployments.", { status: 409 });
 			const body = await request.json().catch(() => undefined) as { count?: number; validDays?: number; campaign?: string } | undefined;
 			if (!body || typeof body !== "object" || Array.isArray(body)) return new Response("expected JSON object", { status: 400 });
 			const count = body.count ?? 1;
@@ -155,6 +160,7 @@ export default {
 		// Operator controls do not run model calls or expose user data to conversations.
 		if (["/access-settings", "/campaigns", "/waitlist", "/subscriptions"].includes(url.pathname)) {
 			if (!same(request.headers.get("authorization"), env.AGENT_SECRET && `Bearer ${env.AGENT_SECRET}`)) return new Response("unauthorized", { status: 401 });
+			if (new Access(env.DB, env).deploymentMode === "self-hosted") return new Response("Commercial access controls are disabled in self-hosted deployments.", { status: 409 });
 			const body = await request.json().catch(() => undefined) as Record<string, unknown> | undefined;
 			if (!body || typeof body !== "object" || Array.isArray(body)) return new Response("expected JSON object", { status: 400 });
 			const access = new Access(env.DB, env);
@@ -195,11 +201,21 @@ export default {
 		}
 
 		// For the operator: the state of one chat.
-		if (url.pathname === "/status" || url.pathname === "/cache") {
+		if (url.pathname === "/status" || url.pathname === "/cache" || url.pathname === "/snapshot-retention") {
 			if (!same(request.headers.get("authorization"), env.AGENT_SECRET && `Bearer ${env.AGENT_SECRET}`)) return new Response("unauthorized", { status: 401 });
 			const chatId = url.searchParams.get("chat") ?? "";
 			if (!/^-?\d+$/.test(chatId)) return new Response("expected ?chat=<id>", { status: 400 });
 			const chat = env.CHAT.get(env.CHAT.idFromName(chatId));
+			if (url.pathname === "/snapshot-retention") {
+				const body = await request.json().catch(() => null) as { renew?: boolean } | null;
+				try {
+					return Response.json(await chat.snapshotRetention(body?.renew === true));
+				} catch (error) {
+					// Worker and DO code updates propagate independently. An older instance may briefly lack this RPC method.
+					if (error instanceof TypeError && error.message.includes('does not implement the method "snapshotRetention"')) return Response.json({ error: "Snapshot maintenance is still rolling out. Retry shortly." }, { status: 503, headers: { "retry-after": "60" } });
+					throw error;
+				}
+			}
 			return Response.json(url.pathname === "/cache" ? await chat.cacheStatus() : await chat.status());
 		}
 
