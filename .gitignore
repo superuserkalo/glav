@@ -3,3 +3,8 @@
 agent/node_modules/
 agent/data/
 agent/mcp.json
+cloud/node_modules/
+cloud/.dev.vars
+cloud/.wrangler/
+.scratch/
+/trial-codes-2026-10-11.txt

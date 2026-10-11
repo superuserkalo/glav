@@ -1,0 +1,161 @@
+{
+  "verifiedAt": "2026-10-11T10:57:18.991Z",
+  "fixture": "invented weather content only",
+  "records": [
+    {
+      "arm": "sdk-default",
+      "scenario": "cold",
+      "model": "gpt-6-luna",
+      "inputTokens": 1973,
+      "cachedTokens": 0,
+      "cacheWriteTokens": 1970,
+      "outputTokens": 36,
+      "inputCostUsd": 0.00024655,
+      "totalCostUsd": 0.00026455,
+      "latencyMs": 1755
+    },
+    {
+      "arm": "sdk-default",
+      "scenario": "changed-user-suffix",
+      "model": "gpt-6-luna",
+      "inputTokens": 1973,
+      "cachedTokens": 1959,
+      "cacheWriteTokens": 11,
+      "outputTokens": 47,
+      "inputCostUsd": 0.000021265,
+      "totalCostUsd": 0.000044765,
+      "latencyMs": 1090,
+      "diagnostic": {
+        "type": "cache_miss",
+        "cache_missed_tokens": 11,
+        "comparison_reusable_tokens": 2404,
+        "reason": "input_changed"
+      }
+    },
+    {
+      "arm": "sdk-default",
+      "scenario": "append-after-restart",
+      "model": "gpt-6-luna",
+      "inputTokens": 2037,
+      "cachedTokens": 1970,
+      "cacheWriteTokens": 64,
+      "outputTokens": 5,
+      "inputCostUsd": 0.000028000000000000003,
+      "totalCostUsd": 0.000030500000000000003,
+      "latencyMs": 1392,
+      "diagnostic": {
+        "type": "cache_hit"
+      }
+    },
+    {
+      "arm": "sdk-default",
+      "scenario": "tool-result-boundary",
+      "model": "gpt-6-luna",
+      "inputTokens": 2091,
+      "cachedTokens": 2034,
+      "cacheWriteTokens": 54,
+      "outputTokens": 5,
+      "inputCostUsd": 0.00002739,
+      "totalCostUsd": 0.00002989,
+      "latencyMs": 836,
+      "diagnostic": {
+        "type": "cache_hit"
+      }
+    },
+    {
+      "arm": "sdk-default",
+      "scenario": "intentional-prefix-change",
+      "model": "gpt-6-luna",
+      "inputTokens": 1976,
+      "cachedTokens": 0,
+      "cacheWriteTokens": 1973,
+      "outputTokens": 5,
+      "inputCostUsd": 0.000246925,
+      "totalCostUsd": 0.000249425,
+      "latencyMs": 1188,
+      "diagnostic": {
+        "type": "unavailable"
+      }
+    },
+    {
+      "arm": "hardened",
+      "scenario": "cold",
+      "model": "gpt-6-luna",
+      "inputTokens": 1973,
+      "cachedTokens": 0,
+      "cacheWriteTokens": 1970,
+      "outputTokens": 29,
+      "inputCostUsd": 0.00024655,
+      "totalCostUsd": 0.00026105,
+      "latencyMs": 1586
+    },
+    {
+      "arm": "hardened",
+      "scenario": "changed-user-suffix",
+      "model": "gpt-6-luna",
+      "inputTokens": 1973,
+      "cachedTokens": 1959,
+      "cacheWriteTokens": 11,
+      "outputTokens": 49,
+      "inputCostUsd": 0.000021265,
+      "totalCostUsd": 0.000045765,
+      "latencyMs": 1610,
+      "diagnostic": {
+        "type": "cache_miss",
+        "cache_missed_tokens": 11,
+        "comparison_reusable_tokens": 2404,
+        "reason": "input_changed"
+      }
+    },
+    {
+      "arm": "hardened",
+      "scenario": "append-after-restart",
+      "model": "gpt-6-luna",
+      "inputTokens": 2039,
+      "cachedTokens": 1970,
+      "cacheWriteTokens": 66,
+      "outputTokens": 5,
+      "inputCostUsd": 0.000028250000000000002,
+      "totalCostUsd": 0.00003075,
+      "latencyMs": 1847,
+      "diagnostic": {
+        "type": "cache_hit"
+      }
+    },
+    {
+      "arm": "hardened",
+      "scenario": "tool-result-boundary",
+      "model": "gpt-6-luna",
+      "inputTokens": 2093,
+      "cachedTokens": 2036,
+      "cacheWriteTokens": 54,
+      "outputTokens": 5,
+      "inputCostUsd": 0.000027410000000000004,
+      "totalCostUsd": 0.000029910000000000003,
+      "latencyMs": 768,
+      "diagnostic": {
+        "type": "cache_hit"
+      }
+    },
+    {
+      "arm": "hardened",
+      "scenario": "intentional-prefix-change",
+      "model": "gpt-6-luna",
+      "inputTokens": 1976,
+      "cachedTokens": 0,
+      "cacheWriteTokens": 1973,
+      "outputTokens": 5,
+      "inputCostUsd": 0.000246925,
+      "totalCostUsd": 0.000249425,
+      "latencyMs": 1250,
+      "diagnostic": {
+        "type": "unavailable"
+      }
+    }
+  ],
+  "summary": {
+    "changedSuffixInputCostReduction": 0,
+    "warmTokenHitRate": 0.9929042067916878,
+    "totalCheckCostUsd": 0.00123603
+  }
+}

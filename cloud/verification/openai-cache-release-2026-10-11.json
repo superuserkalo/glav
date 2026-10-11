@@ -1,0 +1,26 @@
+{
+  "deployedAt": "2026-10-11T11:01:56.765Z",
+  "worker": "glav",
+  "version": "fbaf6172-1fb8-4dd6-8189-650a54cf1fca",
+  "previousVersion": "181260c3-017d-4d4e-9f67-242306c9f15f",
+  "scope": "cache changes only; concurrent trial-access changes preserved in workspace and excluded from release",
+  "validation": {
+    "typecheck": "passed",
+    "releaseTestsPassed": 22,
+    "cacheEndpoint": {
+      "unauthenticatedStatus": 401,
+      "authenticatedStatus": 200,
+      "returnsConversationContent": false
+    },
+    "liveModelCheck": "invented weather fixture; see openai-cache-2026-10-11.json"
+  },
+  "deployedSourceSha256": {
+    "chat.ts": "906a149ad676851831e947b90fb4c67098c60ce25649225df750ea5fc6c883f8",
+    "index.ts": "1f704c3b97fb02bd3caa751e0622c6deb0e76d7129565f67aab1ec7350bc474b",
+    "telegram.ts": "d93da594860316f722776a0f412b07506667806503f5998dd2311e91014b5eef",
+    "telegram-tools.ts": "f7160ea48a34128cdb59e655cf918957b0229eff3a3590adc6cd8cfa74d40076",
+    "polls.ts": "8840fa0cc91b05fda3df65090df6a34f0cc6255f663cde49cdd47db005208863",
+    "poll-context.ts": "eae6a0195eb02c2332aed496da7a2a1544a24d7a709651b2578715d0c6afe1a2",
+    "openai-cache.ts": "977ee3084182c1cc240b26b770b9870d743196a85bdb081b3714b0415d76ce70"
+  }
+}

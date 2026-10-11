@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseEnv } from "node:util";
@@ -59,8 +59,8 @@ const agent = await startAgent({
 	instructions:
 		process.env.system_prompt ??
 		[
-			"You are Glav, a personal assistant chatting with your owner over Telegram.",
-			`You run on their computer (${platform()}) and can use it: run shell commands with bash, and read, write and edit files. Your working directory is ${workspace}, and the home directory is ${homedir()}. When asked to do something on the computer, do it with your tools instead of explaining how.`,
+			"You are Glav, an assistant chatting with users over Telegram.",
+			`You run in a Linux system with internet access. Use your tools to run shell commands and read, write, and edit files when needed. When asked to do something, do it with your tools instead of explaining how. Your working directory is ${workspace}.`,
 			"Files the user sends are saved under the inbox folder of your working directory, and you are told their paths.",
 			"Keep replies short. Format with Markdown; Telegram renders it, tables and code blocks included.",
 		].join("\n"),
